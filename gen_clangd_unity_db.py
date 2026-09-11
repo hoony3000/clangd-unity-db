@@ -1,253 +1,334 @@
 #!/usr/bin/env python3
-"""Generate clangd compile_commands.json for unity-style C projects.
-
-This targets projects where a master C/header file directly includes implementation
-files, e.g. #include "foo.c". clangd normally treats foo.c as an independent
-translation unit when opened, which can cause many false diagnostics. This tool
-creates a per-file forced-include preamble containing the master's source prefix
-before each active .c include, so clangd sees roughly the same context as the real
-unity build.
-
-Conditional compilation is evaluated by the real compiler preprocessor (gcc/cc),
-not by a Python reimplementation. Pass the same -D/-I flags used by the build.
-"""
-
-from __future__ import print_function
-
+"""Generate a clangd-only database from real GCC unity include traces (Python 3.6+)."""
 import argparse
 import json
 import os
+from pathlib import Path
 import re
 import shlex
 import subprocess
 import sys
-from pathlib import Path
+import tempfile
+import uuid
 
-INCLUDE_C_RE = re.compile(r'^\s*#\s*include\s*["<]([^">]+\.c)[">]')
-COND_OPEN_RE = re.compile(r'^\s*#\s*(if|ifdef|ifndef)\b')
-COND_CLOSE_RE = re.compile(r'^\s*#\s*endif\b')
-SENTINEL_RE = re.compile(r'__CLANGD_UNITY_INCLUDE_(\d+)__')
-
-
-def eprint(*args):
-    print(*args, file=sys.stderr)
-
-
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="Generate compile_commands.json for C unity builds that #include .c files."
-    )
-    p.add_argument("master", help="Master .c/.h file containing direct #include \"*.c\" lines")
-    p.add_argument("--root", default=".", help="Project root / compilation directory (default: cwd)")
-    p.add_argument("--cc", default=os.environ.get("CC", "gcc"), help="Compiler/preprocessor command (default: $CC or gcc)")
-    p.add_argument("--cflags", default="", help="Common build flags as one shell-style string, e.g. '-Iinc -DFEATURE=1 -std=gnu99'")
-    p.add_argument("--flag", action="append", default=[], help="Additional compiler flag; repeat as needed")
-    p.add_argument("--output", default="compile_commands.json", help="Output compilation database path, relative to root unless absolute")
-    p.add_argument("--context-dir", default=".clangd-unity", help="Generated context directory, relative to root unless absolute")
-    p.add_argument("--all", action="store_true", help="Also generate entries for inactive conditional .c includes. These entries use textual context and may not match the selected build configuration.")
-    p.add_argument("--keep-probe", action="store_true", help="Keep the temporary preprocessor probe file for debugging")
-    p.add_argument("--verbose", action="store_true")
-    return p.parse_args()
+MARKER = re.compile(r'^# (\d+) ("(?:[^"\\]|\\.)*")(.*)$')
+DIRECTIVE = re.compile(r'^\s*#\s*(\w+)\b')
+PAIRED = {'-I', '-D', '-U', '-include', '-imacros', '-isystem', '-iquote',
+          '-idirafter', '-isysroot', '--sysroot', '-iprefix', '-iwithprefix',
+          '-iwithprefixbefore', '-B', '-x', '-std', '-target', '--target',
+          '-Xpreprocessor', '-Xclang', '-arch'}
 
 
-def collect_candidates(lines):
-    out = []
-    for lineno, line in enumerate(lines, 1):
-        m = INCLUDE_C_RE.match(line)
-        if m:
-            out.append({"index": len(out), "line": lineno, "include": m.group(1), "text": line.rstrip("\n")})
-    return out
+def absolute(value, root):
+    # Keep lexical paths: resolving symlinks can change quoted include lookup.
+    return Path(os.path.abspath(os.path.join(str(root), str(value))))
 
 
-def make_probe(lines, candidates):
-    by_line = {c["line"]: c for c in candidates}
+def write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode='w', dir=str(path.parent), delete=False) as f:
+        json.dump(value, f, indent=2)
+        f.write('\n')
+        temp = f.name
+    os.replace(temp, str(path))
+
+
+def response_args(args, root, depth=0):
+    if depth > 10:
+        raise ValueError('Response files nested too deeply')
     result = []
-    for lineno, line in enumerate(lines, 1):
-        c = by_line.get(lineno)
-        if c is None:
-            result.append(line)
+    for arg in args:
+        if arg.startswith('@'):
+            result.extend(response_args(shlex.split(absolute(arg[1:], root).read_text()), root, depth + 1))
         else:
-            # #warning is processed only in active preprocessor branches and is
-            # supported by old GCC versions including CentOS 7-era GCC.
-            result.append('#warning __CLANGD_UNITY_INCLUDE_%d__\n' % c["index"])
-    return "".join(result)
+            result.append(arg)
+    return result
 
 
-def detect_active(cc, flags, master, root, probe_path, probe_text, verbose=False):
-    probe_path.write_text(probe_text)
-    cmd = [cc, "-E", "-x", "c"] + flags + [str(probe_path)]
-    if verbose:
-        eprint("probe:", " ".join(shlex.quote(x) for x in cmd))
-    proc = subprocess.run(
-        cmd,
-        cwd=str(root),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        universal_newlines=True,
-    )
-    active = set(int(m.group(1)) for m in SENTINEL_RE.finditer(proc.stderr or ""))
-    if proc.returncode != 0:
-        eprint("warning: preprocessor returned %d while detecting active includes." % proc.returncode)
-        eprint("         Active includes seen before the error will still be used.")
-        if proc.stderr:
-            eprint(proc.stderr.rstrip())
-    return active
-
-
-def conditional_depth_before(lines, target_line):
-    depth = 0
-    for lineno, line in enumerate(lines, 1):
-        if lineno >= target_line:
-            break
-        if COND_OPEN_RE.match(line):
-            depth += 1
-        elif COND_CLOSE_RE.match(line):
-            depth = max(0, depth - 1)
-    return depth
-
-
-def safe_name(master, include_path, index):
-    raw = "%04d_%s_%s" % (index, master.stem, include_path)
-    return re.sub(r'[^A-Za-z0-9_.-]+', '__', raw) + ".h"
-
-
-def extract_include_dirs(flags, root):
-    dirs = []
+def clean_flags(args, source, root):
+    """Remove build outputs; never invoke a shell or retain dependency side effects."""
+    args = response_args(args, root)
+    result = []
     i = 0
-    while i < len(flags):
-        f = flags[i]
-        val = None
-        if f == "-I" and i + 1 < len(flags):
-            i += 1
-            val = flags[i]
-        elif f.startswith("-I") and len(f) > 2:
-            val = f[2:]
-        if val:
-            p = Path(val)
-            if not p.is_absolute():
-                p = (root / p).resolve()
-            dirs.append(p)
+    while i < len(args):
+        a = args[i]
         i += 1
-    return dirs
+        if a in ('-o', '-MF', '-MT', '-MQ', '-MJ'):
+            if i == len(args):
+                raise ValueError('Missing argument for ' + a)
+            i += 1
+        elif a in ('-c', '-S', '-E', '-M', '-MM', '-MD', '-MMD', '-MP', '-MG', '-P', '-dI', '-dD'):
+            continue
+        elif any(a.startswith(p) and a != p for p in ('-o', '-MF', '-MT', '-MQ', '-MJ')):
+            continue
+        elif a.startswith(('-Wp,', '-save-temps', '-fpreprocessed', '-fdirectives-only', '-ivfsoverlay', '-include-pch')):
+            raise ValueError('Unsupported preprocessing/output option: ' + a)
+        elif a in PAIRED:
+            if i == len(args):
+                raise ValueError('Missing argument for ' + a)
+            result.extend((a, args[i]))
+            i += 1
+        elif not a.startswith('-'):
+            if absolute(a, root) != source:
+                raise ValueError('Unexpected input (one C source per command required): ' + a)
+        else:
+            result.append(a)
+    return result
 
 
-def resolve_include(master, include_path, root, include_dirs):
-    p = Path(include_path)
-    if p.is_absolute() and p.exists():
-        return p.resolve()
-    candidates = [(master.parent / p).resolve(), (root / p).resolve()]
-    candidates.extend((d / p).resolve() for d in include_dirs)
-    for c in candidates:
-        if c.exists():
-            return c
-    # Preserve a deterministic path even if generated later by the build.
-    return (master.parent / p).resolve()
+def logical_lines(text):
+    """C line splicing and comment removal, retaining physical line ranges."""
+    parts = text.splitlines(True)
+    block = False
+    i = 0
+    while i < len(parts):
+        start = i + 1
+        s = parts[i]
+        i += 1
+        while s.endswith('\\\n') and i < len(parts):
+            s = s[:-2] + parts[i]
+            i += 1
+        out = []
+        j = 0
+        quote = None
+        while j < len(s):
+            if block:
+                end = s.find('*/', j)
+                if end < 0:
+                    break
+                block = False
+                out.append(' ')
+                j = end + 2
+            elif quote:
+                out.append(s[j])
+                if s[j] == '\\' and j + 1 < len(s):
+                    j += 1
+                    out.append(s[j])
+                elif s[j] == quote:
+                    quote = None
+                j += 1
+            elif s.startswith('/*', j):
+                block = True
+                out.append(' ')
+                j += 2
+            elif s.startswith('//', j):
+                break
+            else:
+                if s[j] in ('"', "'"):
+                    quote = s[j]
+                out.append(s[j])
+                j += 1
+        yield start, i, ''.join(out)
 
 
-def write_context(path, lines, target_line, master):
-    prefix = lines[: target_line - 1]
-    depth = conditional_depth_before(lines, target_line)
-    with path.open("w") as f:
-        f.write("/* AUTO-GENERATED by gen_clangd_unity_db.py; do not edit. */\n")
-        f.write("/* Context before %s:%d */\n\n" % (master, target_line))
-        f.writelines(prefix)
-        if prefix and not prefix[-1].endswith("\n"):
-            f.write("\n")
-        if depth:
-            f.write("\n/* Close conditionals opened in the source prefix. */\n")
-            for _ in range(depth):
-                f.write("#endif\n")
+def prefix(path, include_line, keep_include):
+    text = path.read_text(encoding='utf-8')
+    depth = 0
+    for start, end, logical in logical_lines(text):
+        m = DIRECTIVE.match(logical)
+        name = m.group(1) if m else ''
+        if name == 'line' or logical.lstrip().startswith('# '):
+            raise ValueError('Explicit line remapping is unsupported: ' + str(path))
+        if start <= include_line <= end:
+            if name not in ('include', 'include_next'):
+                raise ValueError('Trace does not match source include at %s:%s' % (path, include_line))
+            cut = end if keep_include else start - 1
+            return ''.join(text.splitlines(True)[:cut]) + '\n' + '#endif\n' * depth
+        if name in ('if', 'ifdef', 'ifndef'):
+            depth += 1
+        elif name == 'endif':
+            depth -= 1
+    raise ValueError('Cannot locate include at %s:%s' % (path, include_line))
+
+
+def trace_includes(output, root, source):
+    current = None
+    line = 0
+    stack = []
+    pending = {}
+    targets = []
+    entered = {}
+    for raw in output.splitlines():
+        m = MARKER.match(raw)
+        if not m:
+            if re.match(r'^\s*#\s*include(?:_next)?\b', raw):
+                pending[current] = line
+            line += 1
+            continue
+        number = int(m.group(1))
+        name = json.loads(m.group(2))
+        path = None if name.startswith('<') else str(absolute(name, root))
+        flags = m.group(3).split()
+        if '1' in flags and path:
+            entered[path] = entered.get(path, 0) + 1
+            edge = (current, pending.pop(current, None), path)
+            stack.append(edge)
+            if path.endswith('.c') and path != str(source):
+                chain = list(stack)
+                # Compiler-injected headers have no source include location.
+                if not chain or chain[0][0] != str(source) or any(e[1] is None for e in chain):
+                    raise ValueError('C include outside the root source include chain: ' + path)
+                if entered[path] > 1 or any(entered.get(e[0], 0) > 1 for e in chain):
+                    raise ValueError('Repeated include context is ambiguous: ' + path)
+                targets.append((path, chain))
+        elif '2' in flags:
+            if stack:
+                stack.pop()
+        current, line = path, number
+    return targets
+
+
+def capture(args):
+    command = args.build_command
+    if command and command[0] == '--':
+        command = command[1:]
+    if not command:
+        raise ValueError('Use --capture build-commands.json -- make -B [target]')
+    root = Path(args.root).resolve()
+    output = absolute(args.capture, root)
+    with tempfile.TemporaryDirectory(prefix='unity-capture-') as log:
+        wrapper = [sys.executable, str(Path(__file__).resolve()), '--record', log, '--'] + shlex.split(args.cc)
+        cc = ' '.join(shlex.quote(s) for s in wrapper)
+        # GNU make command-line assignments reach recursive make invocations.
+        build = command + ['CC=' + cc]
+        print('Running build:', ' '.join(shlex.quote(s) for s in build), flush=True)
+        result = subprocess.call(build, cwd=str(root))
+        if result:
+            raise ValueError('Build failed (%d); capture database was not replaced' % result)
+        records = []
+        for p in sorted(Path(log).glob('*.json')):
+            records.extend(json.loads(p.read_text()))
+        if not records:
+            raise ValueError('No C compilations captured. Use make -B; Makefile must honor $(CC).')
+        write_json(output, records)
+    print('Captured %d compilation command(s): %s' % (len(records), output))
+
+
+def record():
+    log = Path(sys.argv[2])
+    command = sys.argv[4:]
+    status = subprocess.call(command)
+    if status == 0:
+        expanded = response_args(command[1:], Path.cwd())
+        if '-c' in expanded:
+            sources = []
+            skip = False
+            for a in expanded:
+                if skip:
+                    skip = False
+                elif a in PAIRED or a in ('-o', '-MF', '-MT', '-MQ'):
+                    skip = True
+                elif not a.startswith('-') and a.endswith('.c'):
+                    sources.append(a)
+            write_json(log / (uuid.uuid4().hex + '.json'), [
+                {'directory': str(Path.cwd()), 'file': str(absolute(s, Path.cwd())),
+                 'arguments': command} for s in sources])
+    return status
+
+
+def generate(args):
+    root = Path(args.root).resolve()
+    source = absolute(args.master, root) if args.master else None
+    compiler = shlex.split(args.cc)
+    flags = shlex.split(args.cflags) + args.flag
+    if args.build_db:
+        db = absolute(args.build_db, root)
+        if db == absolute(args.output, root):
+            raise ValueError('Input build database and clangd output must be different files')
+        entries = json.loads(db.read_text())
+        selected = []
+        for entry in entries:
+            directory = absolute(entry['directory'], db.parent)
+            file = absolute(entry['file'], directory)
+            if source is None or file == source:
+                selected.append((entry, directory, file))
+        if len(selected) != 1:
+            raise ValueError('Select exactly one build command with the root .c path; found %d' % len(selected))
+        entry, root, source = selected[0]
+        command = entry.get('arguments') or shlex.split(entry['command'])
+        compiler = [command[0]]
+        # Captures use the real compiler, never the recording wrapper.
+        flags = command[1:] + flags
+    if source is None or not source.is_file():
+        raise ValueError('Provide the actual compiled root .c file (e.g. main.c)')
+    flags = clean_flags(flags, source, root)
+    if not compiler:
+        raise ValueError('Compiler command is empty')
+    command = compiler + flags + ['-E', '-dI', '-x', 'c', str(source)]
+    if args.verbose:
+        print('Trace:', ' '.join(shlex.quote(s) for s in command))
+    proc = subprocess.run(command, cwd=str(root), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          universal_newlines=True)
+    if proc.returncode:
+        raise ValueError('GCC preprocessing failed; database not replaced:\n' + proc.stderr)
+    if proc.stderr:
+        print(proc.stderr, file=sys.stderr, end='')
+    targets = trace_includes(proc.stdout, root, source)
+    if not targets:
+        raise ValueError('No active nested .c includes found')
+    # Validate all source prefixes before publishing any new database.
+    prepared = []
+    for target, chain in targets:
+        prepared.append((target, [(parent, prefix(Path(parent), line, i < len(chain) - 1))
+                                  for i, (parent, line, child) in enumerate(chain)]))
+    destination = absolute(args.context_dir, Path(args.root).resolve())
+    destination.mkdir(parents=True, exist_ok=True)
+    # Immutable per-run paths keep the previous database valid on failure.
+    run = Path(tempfile.mkdtemp(prefix='run-', dir=str(destination)))
+    commands = [{'directory': str(root), 'file': str(source),
+                 'arguments': compiler + flags + ['-x', 'c', '-c', str(source)]}]
+    manifest = []
+    for index, (target, contexts) in enumerate(prepared):
+        mappings = []
+        for level, (original, content) in enumerate(contexts):
+            external = run / ('%04d-%02d.h' % (index, level))
+            external.write_text(content, encoding='utf-8')
+            mappings.append({'type': 'file', 'name': original, 'external-contents': str(external)})
+        overlay = run / ('%04d-overlay.json' % index)
+        write_json(overlay, {'version': 0, 'use-external-names': False, 'roots': mappings})
+        commands.append({'directory': str(root), 'file': target,
+                         'arguments': compiler + flags + ['-ivfsoverlay', str(overlay),
+                         '-include', str(source), '-x', 'c', '-c', target]})
+        manifest.append({'source': target, 'overlay': str(overlay),
+                         'include_chain': [list(e) for e in targets[index][1]]})
+    write_json(run / 'manifest.json', {'root_source': str(source), 'entries': manifest})
+    output = absolute(args.output, Path(args.root).resolve())
+    write_json(output, commands)
+    print('Generated %d included-C entries plus the root entry: %s' % (len(targets), output))
+    print('Contexts:', run)
 
 
 def main():
-    args = parse_args()
-    root = Path(args.root).resolve()
-    master = Path(args.master)
-    if not master.is_absolute():
-        master = (root / master).resolve()
-    if not master.exists():
-        eprint("error: master file not found:", master)
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('master', nargs='?', help='Actual compiled root source, e.g. main.c')
+    p.add_argument('--root', default='.', help='Project/build working directory')
+    p.add_argument('--cc', default=os.environ.get('CC', 'gcc'), help='GCC compiler command')
+    p.add_argument('--cflags', default='')
+    p.add_argument('--flag', action='append', default=[])
+    p.add_argument('--build-db', help='Input compilation database with real build commands')
+    p.add_argument('--output', default='compile_commands.json')
+    p.add_argument('--context-dir', default='.clangd-unity')
+    p.add_argument('--capture', help='Capture GNU make C compiler calls to this database')
+    p.add_argument('--verbose', action='store_true')
+    argv = sys.argv[1:]
+    build_command = []
+    if '--' in argv:
+        split = argv.index('--')
+        argv, build_command = argv[:split], argv[split + 1:]
+    args = p.parse_args(argv)
+    args.build_command = build_command
+    try:
+        if args.capture:
+            capture(args)
+        else:
+            if build_command:
+                raise ValueError('Trailing build command requires --capture')
+            generate(args)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print('error:', exc, file=sys.stderr)
         return 2
-
-    flags = shlex.split(args.cflags) + list(args.flag)
-    lines = master.read_text(errors="replace").splitlines(True)
-    candidates = collect_candidates(lines)
-    if not candidates:
-        eprint('error: no direct #include "*.c" candidates found in', master)
-        return 2
-
-    context_dir = Path(args.context_dir)
-    if not context_dir.is_absolute():
-        context_dir = (root / context_dir).resolve()
-    context_dir.mkdir(parents=True, exist_ok=True)
-
-    probe_path = context_dir / "__probe__.c"
-    probe_text = make_probe(lines, candidates)
-    active = detect_active(args.cc, flags, master, root, probe_path, probe_text, args.verbose)
-    if not args.keep_probe:
-        try:
-            probe_path.unlink()
-        except OSError:
-            pass
-
-    include_dirs = extract_include_dirs(flags, root)
-    selected = candidates if args.all else [c for c in candidates if c["index"] in active]
-
-    if not selected:
-        eprint("error: no active .c includes were detected.")
-        eprint("       Pass the same -D/-I flags as the real build via --cflags/--flag.")
-        return 3
-
-    commands = []
-    manifest = []
-    for c in selected:
-        source = resolve_include(master, c["include"], root, include_dirs)
-        ctx = context_dir / safe_name(master, c["include"], c["index"])
-        write_context(ctx, lines, c["line"], master)
-
-        command_args = [args.cc] + flags + ["-I" + str(master.parent), "-include", str(ctx), "-c", str(source)]
-        commands.append({
-            "directory": str(root),
-            "file": str(source),
-            "arguments": command_args,
-        })
-        manifest.append({
-            "source": str(source),
-            "include": c["include"],
-            "master_line": c["line"],
-            "active": c["index"] in active,
-            "context": str(ctx),
-        })
-
-    output = Path(args.output)
-    if not output.is_absolute():
-        output = (root / output).resolve()
-    with output.open("w") as f:
-        json.dump(commands, f, indent=2)
-        f.write("\n")
-
-    manifest_path = context_dir / "manifest.json"
-    with manifest_path.open("w") as f:
-        json.dump({
-            "master": str(master),
-            "compiler": args.cc,
-            "flags": flags,
-            "active_candidate_indexes": sorted(active),
-            "entries": manifest,
-        }, f, indent=2)
-        f.write("\n")
-
-    print("Generated %d clangd entries" % len(commands))
-    print("  database:", output)
-    print("  contexts:", context_dir)
-    print("  manifest:", manifest_path)
-    inactive = len(candidates) - len(active)
-    if inactive:
-        print("  inactive conditional .c includes:", inactive)
-        if not args.all:
-            print("  (inactive entries omitted; use --all only for diagnostic experiments)")
     return 0
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__ == '__main__':
+    sys.exit(record() if sys.argv[1:2] == ['--record'] else main())

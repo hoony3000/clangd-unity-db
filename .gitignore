@@ -1,4 +1,5 @@
 compile_commands.json
+build-commands.json
 .clangd-unity/
 __pycache__/
 *.pyc
